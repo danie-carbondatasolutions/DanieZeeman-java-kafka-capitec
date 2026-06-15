@@ -1,0 +1,4 @@
+com/example/paymentservice/consumer/OrderPlacedConsumer.class
+com/example/paymentservice/producer/PaymentResultProducer.class
+com/example/paymentservice/PaymentServiceApplication.class
+com/example/paymentservice/model/PaymentDecision.class
