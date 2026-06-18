@@ -1,36 +1,56 @@
 package com.example.paymentservice.consumer;
 
-import com.example.paymentservice.producer.PaymentResultProducer;
+import com.example.paymentservice.model.OrderEvent;
 import com.example.paymentservice.model.PaymentDecision;
+import com.example.paymentservice.producer.PaymentResultProducer;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.support.KafkaHeaders;
+import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.stereotype.Component;
 
 @Component
 public class OrderPlacedConsumer {
 
-    private final PaymentResultProducer resultProducer;
+    private static final Logger log = LoggerFactory.getLogger(OrderPlacedConsumer.class);
 
-    public OrderPlacedConsumer(PaymentResultProducer resultProducer) {
+    private final PaymentResultProducer resultProducer;
+    private final ObjectMapper objectMapper;
+
+    public OrderPlacedConsumer(PaymentResultProducer resultProducer, ObjectMapper objectMapper) {
         this.resultProducer = resultProducer;
+        this.objectMapper = objectMapper;
     }
 
     @KafkaListener(topics = "${ORDER_TOPIC:order.placed}", groupId = "payment-processor-group")
-    public void listen(String message) {
-        System.out.println("[PaymentService] Received order.placed: " + message);
+    public void listen(String message,
+            @Header(KafkaHeaders.RECEIVED_PARTITION) int partition,
+            @Header(KafkaHeaders.OFFSET) long offset) {
+        log.info("[PaymentService] Received order.placed: partition={}, offset={}, payload={}", partition, offset, message);
 
-        // TODO: Deserialize the order payload and calculate the payment amount.
-        var decision = simulatePayment();
+        try {
+            OrderEvent order = objectMapper.readValue(message, OrderEvent.class);
 
-        if (decision.isSuccess()) {
-            resultProducer.sendSuccess(decision.getOrderId(), message);
-        } else {
-            resultProducer.sendFailure(decision.getOrderId(), message);
+            PaymentDecision decision = simulatePayment(order.getOrderId());
+
+            if (decision.isSuccess()) {
+                log.info("Payment SUCCEEDED for orderId={}, amount={}", order.getOrderId(), order.getAmount());
+                resultProducer.sendSuccess(order.getOrderId(), order.getAmount());
+            } else {
+                log.warn("Payment FAILED for orderId={}, amount={}", order.getOrderId(), order.getAmount());
+                resultProducer.sendFailure(order.getOrderId(), order.getAmount());
+            }
+
+        } catch (Exception ex) {
+            log.error("Failed to process order.placed message, routing to DLQ. payload={}, error={}", message, ex.getMessage());
+            resultProducer.sendToDlq(message, ex.getMessage());
         }
     }
 
-    private PaymentDecision simulatePayment() {
-        var orderId = java.util.UUID.randomUUID().toString();
-        var success = Math.random() > 0.5;
+    private PaymentDecision simulatePayment(String orderId) {
+        boolean success = Math.random() > 0.5;
         return new PaymentDecision(orderId, success);
     }
 }
