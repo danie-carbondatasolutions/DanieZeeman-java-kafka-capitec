@@ -20,6 +20,8 @@ spec:
               value: "kafka-service:9092"
             - name: ORDER_TOPIC
               value: "order.placed"
+            - name: PRODUCER_INTERVAL_MS
+              value: "2000"
           resources:
             requests:
               cpu: "100m"
@@ -56,6 +58,8 @@ spec:
               value: "payment.failed"
             - name: PAYMENT_DLQ_TOPIC
               value: "payment.dlq"
+            - name: CONSUMER_GROUP_ID
+              value: "payment-processor-group"
           resources:
             requests:
               cpu: "100m"
@@ -88,6 +92,8 @@ spec:
               value: "payment.succeeded"
             - name: INVENTORY_DLQ_TOPIC
               value: "inventory.dlq"
+            - name: CONSUMER_GROUP_ID
+              value: "inventory-updater-group"
           resources:
             requests:
               cpu: "100m"

@@ -1,0 +1,54 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-topic-setup
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: kafka-topics
+          image: confluentinc/cp-kafka
+          command:
+            - /bin/bash
+            - -c
+            - |
+              # Wait for Kafka to be ready
+              until kafka-topics --bootstrap-server kafka-service:9092 --list; do
+                echo "Waiting for Kafka..."; sleep 5;
+              done
+
+              # Create topics with 3 partitions to support 2 replicas per service
+              # (replicas <= partitions to avoid idle consumers)
+              kafka-topics --bootstrap-server kafka-service:9092 \
+                --create --if-not-exists \
+                --topic order.placed \
+                --partitions 3 \
+                --replication-factor 3
+
+              kafka-topics --bootstrap-server kafka-service:9092 \
+                --create --if-not-exists \
+                --topic payment.succeeded \
+                --partitions 3 \
+                --replication-factor 3
+
+              kafka-topics --bootstrap-server kafka-service:9092 \
+                --create --if-not-exists \
+                --topic payment.failed \
+                --partitions 3 \
+                --replication-factor 3
+
+              kafka-topics --bootstrap-server kafka-service:9092 \
+                --create --if-not-exists \
+                --topic payment.dlq \
+                --partitions 1 \
+                --replication-factor 3
+
+              kafka-topics --bootstrap-server kafka-service:9092 \
+                --create --if-not-exists \
+                --topic inventory.dlq \
+                --partitions 1 \
+                --replication-factor 3
+
+              echo "All topics created successfully."
+              kafka-topics --bootstrap-server kafka-service:9092 --list

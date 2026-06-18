@@ -42,17 +42,26 @@ class PaymentSucceededConsumerTest {
     }
 
     @Test
-    void doesNotPropagateExceptionOnMalformedJson() {
-        // Consumer must not crash the container on bad input
-        assertDoesNotThrow(() -> consumer.listen("INVALID_JSON", 0, 0L));
+    void throwsOnMalformedJsonSoDefaultErrorHandlerCanRouteToDlq() {
+        // Malformed JSON is rethrown as IllegalArgumentException so that
+        // DefaultErrorHandler can route it to inventory.dlq after retries.
+        assertThrows(IllegalArgumentException.class,
+                () -> consumer.listen("INVALID_JSON", 0, 0L));
         verify(inventoryService, never()).reserveInventory(any());
     }
 
     @Test
-    void doesNotPropagateExceptionWhenInventoryServiceThrows() {
+    void propagatesInventoryServiceExceptionForRetry() {
+        // Processing exceptions propagate to DefaultErrorHandler so retries fire.
         String payload = "{\"orderId\":\"order-1\",\"status\":\"succeeded\",\"amount\":50,\"source\":\"payment-service\"}";
         doThrow(new RuntimeException("DB unavailable")).when(inventoryService).reserveInventory(any());
 
-        assertDoesNotThrow(() -> consumer.listen(payload, 0, 0L));
+        assertThrows(RuntimeException.class, () -> consumer.listen(payload, 0, 0L));
+    }
+
+    @Test
+    void doesNotCallInventoryServiceOnEmptyPayload() {
+        assertThrows(IllegalArgumentException.class, () -> consumer.listen("", 0, 0L));
+        verify(inventoryService, never()).reserveInventory(any());
     }
 }

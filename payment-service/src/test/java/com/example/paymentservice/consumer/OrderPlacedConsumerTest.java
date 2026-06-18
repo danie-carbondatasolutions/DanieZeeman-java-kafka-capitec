@@ -18,25 +18,37 @@ class OrderPlacedConsumerTest {
     @Mock
     private PaymentResultProducer resultProducer;
 
-    private OrderPlacedConsumer consumer;
+    private OrderPlacedConsumer successConsumer;
+    private OrderPlacedConsumer failureConsumer;
+    private OrderPlacedConsumer randomConsumer;
 
     @BeforeEach
     void setUp() {
-        consumer = new OrderPlacedConsumer(resultProducer, new ObjectMapper());
+        // Deterministic consumers — no Math.random() in tests
+        successConsumer = new OrderPlacedConsumer(resultProducer, new ObjectMapper(), () -> true);
+        failureConsumer = new OrderPlacedConsumer(resultProducer, new ObjectMapper(), () -> false);
+        randomConsumer  = new OrderPlacedConsumer(resultProducer, new ObjectMapper());
     }
 
     @Test
-    void routesToSuccessOrFailureTopicForValidOrder() {
-        String validPayload = "{\"orderId\":\"1\",\"customerId\":\"c1\",\"amount\":100,\"createdAt\":\"2026-01-01T00:00:00Z\"}";
+    void routesToSuccessTopicWhenPaymentSucceeds() {
+        String payload = "{\"orderId\":\"1\",\"customerId\":\"c1\",\"amount\":100,\"createdAt\":\"2026-01-01T00:00:00Z\"}";
 
-        // Run enough times to statistically hit both branches (50/50 random)
-        for (int i = 0; i < 20; i++) {
-            consumer.listen(validPayload.replace("\"orderId\":\"1\"", "\"orderId\":\"" + i + "\""), 0, i);
-        }
+        successConsumer.listen(payload, 0, 0L);
 
-        // At least one success and one failure should have been published
-        verify(resultProducer, atLeastOnce()).sendSuccess(anyString(), anyInt());
-        verify(resultProducer, atLeastOnce()).sendFailure(anyString(), anyInt());
+        verify(resultProducer).sendSuccess("1", 100);
+        verify(resultProducer, never()).sendFailure(anyString(), anyInt());
+        verify(resultProducer, never()).sendToDlq(anyString(), anyString());
+    }
+
+    @Test
+    void routesToFailureTopicWhenPaymentFails() {
+        String payload = "{\"orderId\":\"2\",\"customerId\":\"c1\",\"amount\":50,\"createdAt\":\"2026-01-01T00:00:00Z\"}";
+
+        failureConsumer.listen(payload, 0, 0L);
+
+        verify(resultProducer).sendFailure("2", 50);
+        verify(resultProducer, never()).sendSuccess(anyString(), anyInt());
         verify(resultProducer, never()).sendToDlq(anyString(), anyString());
     }
 
@@ -44,7 +56,7 @@ class OrderPlacedConsumerTest {
     void routesToDlqForMalformedJson() {
         String badPayload = "NOT_JSON";
 
-        consumer.listen(badPayload, 0, 0L);
+        successConsumer.listen(badPayload, 0, 0L);
 
         verify(resultProducer).sendToDlq(eq(badPayload), anyString());
         verify(resultProducer, never()).sendSuccess(anyString(), anyInt());
@@ -53,28 +65,34 @@ class OrderPlacedConsumerTest {
 
     @Test
     void routesToDlqForMissingOrderId() {
-        String missingOrderId = "{\"customerId\":\"c1\",\"amount\":50}";
+        successConsumer.listen("{}", 0, 0L);
 
-        consumer.listen(missingOrderId, 0, 0L);
-
-        // orderId is null → sendSuccess/Failure called with null key or DLQ
-        // Depending on implementation, this may route to DLQ
-        // Either way, no exception should propagate to the container
+        // orderId is null — consumer validates and routes to DLQ before payment logic runs
+        verify(resultProducer).sendToDlq(eq("{}"), contains("orderId is null"));
+        verify(resultProducer, never()).sendSuccess(anyString(), anyInt());
+        verify(resultProducer, never()).sendFailure(anyString(), anyInt());
     }
 
     @Test
     void idempotencySkipsDuplicateOrderId() {
         String payload = "{\"orderId\":\"dup-1\",\"customerId\":\"c1\",\"amount\":100,\"createdAt\":\"2026-01-01T00:00:00Z\"}";
 
-        consumer.listen(payload, 0, 0L);
-        consumer.listen(payload, 0, 1L);  // duplicate
+        successConsumer.listen(payload, 0, 0L);
+        successConsumer.listen(payload, 0, 1L); // duplicate — same orderId
 
-        // Success or failure published exactly once (not twice)
-        int successCount = mockingDetails(resultProducer).getInvocations()
-                .stream().filter(i -> i.getMethod().getName().equals("sendSuccess")).toList().size();
-        int failureCount = mockingDetails(resultProducer).getInvocations()
-                .stream().filter(i -> i.getMethod().getName().equals("sendFailure")).toList().size();
+        // sendSuccess called exactly once despite two deliveries
+        verify(resultProducer, times(1)).sendSuccess(eq("dup-1"), eq(100));
+    }
 
-        assertEquals(1, successCount + failureCount);
+    @Test
+    void processesDistinctOrderIdsIndependently() {
+        String payload1 = "{\"orderId\":\"A\",\"customerId\":\"c1\",\"amount\":10,\"createdAt\":\"2026-01-01T00:00:00Z\"}";
+        String payload2 = "{\"orderId\":\"B\",\"customerId\":\"c2\",\"amount\":20,\"createdAt\":\"2026-01-01T00:00:00Z\"}";
+
+        successConsumer.listen(payload1, 0, 0L);
+        successConsumer.listen(payload2, 0, 1L);
+
+        verify(resultProducer).sendSuccess("A", 10);
+        verify(resultProducer).sendSuccess("B", 20);
     }
 }

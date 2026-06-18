@@ -61,19 +61,28 @@ docker build -t danie-carbondatasolutions/payment-service:latest         payment
 docker build -t danie-carbondatasolutions/inventory-service:latest       inventory-service/
 ```
 
-### 4. Deploy services to Kubernetes
+### 4. Create Kafka topics
+
+Topics must be created with 3 partitions before deploying services, so that both replicas of payment-service and inventory-service each receive partition assignments (replicas ≤ partitions).
+
+```bash
+kubectl apply -f k8s/kafka-topics.yaml
+kubectl wait --for=condition=complete job/kafka-topic-setup --timeout=60s
+```
+
+### 5. Deploy services to Kubernetes
 
 ```bash
 kubectl apply -f k8s/java-services.yaml
 ```
 
-### 5. Verify all pods are running
+### 6. Verify all pods are running
 
 ```bash
 kubectl get pods
 ```
 
-### 6. View logs
+### 7. View logs
 
 ```bash
 kubectl logs -f deployment/java-order-producer
@@ -81,7 +90,7 @@ kubectl logs -f deployment/java-payment-service
 kubectl logs -f deployment/java-inventory-service
 ```
 
-### 7. Open Kafka UI
+### 8. Open Kafka UI
 
 Browse to [http://localhost:30080](http://localhost:30080) to inspect topics, consumer group offsets, and messages.
 
@@ -103,6 +112,7 @@ KAFKA_BOOTSTRAP_SERVERS=localhost:30092 mvn spring-boot:run
 | `PAYMENT_DLQ_TOPIC` | `payment.dlq` | Dead-letter topic for payment service |
 | `INVENTORY_DLQ_TOPIC` | `inventory.dlq` | Dead-letter topic for inventory service |
 | `PRODUCER_INTERVAL_MS` | `2000` | Milliseconds between order publishes |
+| `CONSUMER_GROUP_ID` | service-specific default | Override consumer group name (useful for multi-environment deploys) |
 
 ## Running tests
 

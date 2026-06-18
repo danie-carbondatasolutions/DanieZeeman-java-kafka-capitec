@@ -2,6 +2,7 @@ package com.example.inventoryservice.consumer;
 
 import com.example.inventoryservice.model.PaymentResultEvent;
 import com.example.inventoryservice.service.InventoryService;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -23,17 +24,23 @@ public class PaymentSucceededConsumer {
         this.objectMapper = objectMapper;
     }
 
-    @KafkaListener(topics = "${PAYMENT_SUCCESS_TOPIC:payment.succeeded}", groupId = "inventory-updater-group")
+    @KafkaListener(topics = "${PAYMENT_SUCCESS_TOPIC:payment.succeeded}", groupId = "${CONSUMER_GROUP_ID:inventory-updater-group}")
     public void listen(String message,
             @Header(KafkaHeaders.RECEIVED_PARTITION) int partition,
             @Header(KafkaHeaders.OFFSET) long offset) {
         log.info("[InventoryService] Received payment.succeeded: partition={}, offset={}", partition, offset);
 
+        // Deserialization failures are not retryable — route directly to DLQ.
+        PaymentResultEvent event;
         try {
-            PaymentResultEvent event = objectMapper.readValue(message, PaymentResultEvent.class);
-            inventoryService.reserveInventory(event);
-        } catch (Exception ex) {
-            log.error("Failed to process payment.succeeded message. payload={}, error={}", message, ex.getMessage());
+            event = objectMapper.readValue(message, PaymentResultEvent.class);
+        } catch (JsonProcessingException ex) {
+            log.error("Unrecoverable deserialization error, routing to DLQ: payload={}, error={}", message, ex.getMessage());
+            // Rethrow as RuntimeException — DefaultErrorHandler will route to inventory.dlq
+            throw new IllegalArgumentException("Unparseable payment.succeeded message: " + ex.getMessage(), ex);
         }
+
+        // Processing exceptions propagate to DefaultErrorHandler for retry + DLQ routing
+        inventoryService.reserveInventory(event);
     }
 }
