@@ -11,6 +11,10 @@ import org.springframework.kafka.support.KafkaHeaders;
 import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.stereotype.Component;
 
+import java.util.Collections;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
 @Component
 public class OrderPlacedConsumer {
 
@@ -18,6 +22,10 @@ public class OrderPlacedConsumer {
 
     private final PaymentResultProducer resultProducer;
     private final ObjectMapper objectMapper;
+
+    // Idempotency guard: prevents processing the same orderId twice if Kafka
+    // delivers the same message more than once (at-least-once delivery guarantee).
+    private final Set<String> processedOrders = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
     public OrderPlacedConsumer(PaymentResultProducer resultProducer, ObjectMapper objectMapper) {
         this.resultProducer = resultProducer;
@@ -32,6 +40,11 @@ public class OrderPlacedConsumer {
 
         try {
             OrderEvent order = objectMapper.readValue(message, OrderEvent.class);
+
+            if (!processedOrders.add(order.getOrderId())) {
+                log.warn("Duplicate order.placed event for orderId={}, skipping.", order.getOrderId());
+                return;
+            }
 
             PaymentDecision decision = simulatePayment(order.getOrderId());
 

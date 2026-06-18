@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document compares how the Java (Spring Boot + Spring Kafka) and .NET (ASP.NET Core + Confluent.Kafka) implementations of the same event-driven order management system differ across three key dimensions: client configuration, data serialization, and error management.
+This document compares how the Java (Spring Boot + Spring Kafka) and .NET (ASP.NET Core + Confluent.Kafka) implementations of the same event-driven order management system differ across three key dimensions: client configuration, data serialization, and error management. It also covers consumer group scaling behaviour, which differs meaningfully between the two platforms.
 
 ---
 
@@ -52,7 +52,63 @@ Java/Spring Kafka abstracts away the poll loop entirely — `@KafkaListener` doe
 
 ---
 
-## 2. Data Serialization
+## 2. Consumer Groups and Scaling
+
+This is one of the most practically important topics for production deployments.
+
+### Java (Spring Kafka)
+
+Consumer groups are declared directly on the `@KafkaListener` annotation:
+
+```java
+@KafkaListener(topics = "order.placed", groupId = "payment-processor-group")
+public void listen(String message) { ... }
+```
+
+In this project:
+- `payment-processor-group` — all replicas of `payment-service` join this group
+- `inventory-updater-group` — all replicas of `inventory-service` join this group
+
+**How scaling works:** When the `payment-service` Kubernetes Deployment is scaled to 2 replicas, Kafka's group coordinator rebalances the `order.placed` partitions between the two pods. Each pod receives an exclusive subset of partitions — no two pods process the same message. If the topic has 3 partitions and you run 3 replicas, each replica handles exactly one partition. A 4th replica would sit idle because there are no remaining partitions to assign.
+
+Concurrency within a single pod is controlled by:
+```properties
+spring.kafka.listener.concurrency=3
+```
+This spawns 3 consumer threads inside the pod, each assigned a partition — equivalent to running 3 pods for partition distribution purposes.
+
+The two groups (`payment-processor-group` and `inventory-updater-group`) are completely independent. Each maintains its own committed offset on its respective topic. Scaling the payment service does not affect the inventory service's offset or partition assignment.
+
+### .NET (Confluent.Kafka)
+
+Consumer groups work identically at the Kafka protocol level. The difference is in how they are expressed:
+
+```csharp
+var consumerConfig = new ConsumerConfig {
+    BootstrapServers = "localhost:30092",
+    GroupId = "payment-processor-group",
+    AutoOffsetReset = AutoOffsetReset.Earliest,
+    EnableAutoCommit = false
+};
+using var consumer = new ConsumerBuilder<string, string>(consumerConfig).Build();
+consumer.Subscribe("order.placed");
+
+while (!cancellationToken.IsCancellationRequested) {
+    var result = consumer.Consume(cancellationToken);
+    Process(result.Message.Value);
+    consumer.Commit(result);
+}
+```
+
+Scaling a .NET service in Kubernetes triggers the same Kafka rebalance — each pod joins the group with its own consumer instance, and Kafka redistributes partitions. The developer must ensure that each pod creates exactly one consumer per group and subscribes before entering the poll loop.
+
+### Key Difference
+
+Spring Kafka's `@KafkaListener` and `concurrency` property handle the threading model automatically — the framework creates the right number of consumer threads and manages the poll loop. In .NET, the developer must explicitly construct each consumer, manage the poll loop, and ensure clean shutdown on `CancellationToken` cancellation. Java is safer by default; .NET gives explicit control over every thread boundary.
+
+---
+
+## 3. Data Serialization
 
 ### Java
 
@@ -94,26 +150,45 @@ Java/Spring Kafka offers more out-of-the-box JSON automation (embedded type head
 
 ---
 
-## 3. Error Management
+## 4. Error Management
 
-### Java
+### Java — DefaultErrorHandler and @RetryableTopic
 
-Spring Kafka provides a rich error-handling framework:
+Spring Kafka provides two distinct retry mechanisms:
 
-- **`DefaultErrorHandler`**: Catches exceptions from `@KafkaListener` methods, supports configurable retry with backoff, and routes unrecoverable messages to a Dead Letter Topic (DLT).
-- **`DeadLetterPublishingRecoverer`**: Automatically publishes failed messages to a `<topic>.DLT` topic after retries are exhausted.
-- **`@RetryableTopic`**: Annotation-driven retry with multiple retry topics and exponential backoff, without blocking the main consumer thread.
+**Option A — `DefaultErrorHandler` (used in this project):**
 
 ```java
 @Bean
-public DefaultErrorHandler errorHandler(KafkaTemplate<String, String> template) {
-    var recoverer = new DeadLetterPublishingRecoverer(template);
-    var backoff = new FixedBackOff(1000L, 3);
-    return new DefaultErrorHandler(recoverer, backoff);
+public CommonErrorHandler kafkaErrorHandler(KafkaTemplate<String, String> kafkaTemplate) {
+    DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(kafkaTemplate,
+        (record, ex) -> new TopicPartition("payment.dlq", 0));
+    return new DefaultErrorHandler(recoverer, new FixedBackOff(1000L, 3));
 }
 ```
 
-In this project, DLQ routing is implemented manually in the consumer's catch block (`PaymentResultProducer.sendToDlq()`), which is a simpler but equivalent pattern.
+- Retries the failed message in-place up to 3 times with a 1-second pause between attempts.
+- After retries are exhausted, `DeadLetterPublishingRecoverer` publishes the message to the DLQ topic.
+- The consumer thread is **blocked** during the retry wait — this is simple but reduces throughput.
+
+**Option B — `@RetryableTopic` (non-blocking retry):**
+
+```java
+@RetryableTopic(
+    attempts = "4",
+    backoff = @Backoff(delay = 1000, multiplier = 2),
+    dltTopicSuffix = ".dlq"
+)
+@KafkaListener(topics = "order.placed", groupId = "payment-processor-group")
+public void listen(String message) { ... }
+```
+
+- Retries are routed to intermediate retry topics (`order.placed-retry-0`, `order.placed-retry-1`) rather than blocking the main thread.
+- The original consumer continues processing other messages during the backoff window.
+- After all retry topics are exhausted, the message lands on `order.placed.dlq` automatically.
+- This is the preferred pattern for high-throughput services where blocking the consumer thread for retries is unacceptable.
+
+**Key distinction:** `DefaultErrorHandler` blocks the consumer thread during backoff; `@RetryableTopic` does not — it re-enqueues into retry topics and frees the thread immediately. `.NET` has no equivalent to either — all retry logic must be hand-coded.
 
 ### .NET
 
@@ -123,22 +198,24 @@ The Confluent .NET client has no built-in retry/DLQ framework — error handling
 try {
     var result = consumer.Consume(cancellationToken);
     ProcessMessage(result.Message.Value);
+    consumer.Commit(result);
 } catch (ConsumeException ex) {
     logger.LogError("Consume error: {Reason}", ex.Error.Reason);
-    await producer.ProduceAsync("order.placed.dlq", new Message<string, string> { Value = ex.Message.ToString() });
+    await producer.ProduceAsync("order.placed.dlq",
+        new Message<string, string> { Value = ex.Message.ToString() });
 } catch (Exception ex) {
     logger.LogError("Processing error: {Message}", ex.Message);
-    // Route to DLQ manually
+    // Polly retry policy or manual DLQ
 }
 ```
 
 - **No built-in retry**: Developers implement retry logic using Polly (`Microsoft.Extensions.Http.Polly`) or custom loops.
-- **Manual DLQ**: DLQ publishing must be coded explicitly, as in the catch block above.
+- **Manual DLQ**: DLQ publishing must be coded explicitly.
 - **Offset management**: On error, you choose whether to commit the offset (skip) or not commit (reprocess on restart). Java's `ack-mode=record` gives the same per-record control.
 
 ### Key Difference
 
-Spring Kafka's `DefaultErrorHandler` + `DeadLetterPublishingRecoverer` provides production-ready retry and DLQ behaviour out of the box with minimal configuration. In .NET, the same resilience requires explicit Polly policies and manual DLQ producers — more code, but also more transparency into exactly what happens on failure.
+Spring Kafka's `DefaultErrorHandler` + `DeadLetterPublishingRecoverer` provides production-ready retry and DLQ behaviour with minimal configuration. `@RetryableTopic` goes further — it achieves non-blocking retry by routing through intermediate topics, something .NET has no out-of-the-box equivalent for and requires significant custom infrastructure to replicate.
 
 ---
 
@@ -148,10 +225,13 @@ Spring Kafka's `DefaultErrorHandler` + `DeadLetterPublishingRecoverer` provides 
 |---|---|---|
 | Configuration style | `application.properties` + auto-config | `ProducerConfig` / `ConsumerConfig` objects in code |
 | Consumer registration | `@KafkaListener` annotation | Manual `Consume()` loop in `BackgroundService` |
+| In-pod concurrency | `spring.kafka.listener.concurrency=N` | One consumer per `BackgroundService` instance |
+| Consumer group scaling | Automatic rebalance; replicas ≤ partition count | Same Kafka protocol; developer manages consumer lifecycle |
 | Serialization default | `StringSerializer` + Jackson POJO | `StringSerializer` + `System.Text.Json` / Newtonsoft |
 | Type-safe generics | `KafkaTemplate<K,V>` | `IProducer<K,V>` / `IConsumer<K,V>` |
-| Retry / backoff | Built-in `DefaultErrorHandler` + `FixedBackOff` | Manual via Polly or custom logic |
-| DLQ support | Built-in `DeadLetterPublishingRecoverer` | Manual producer send in catch block |
+| Blocking retry | `DefaultErrorHandler` + `FixedBackOff` | Manual via Polly |
+| Non-blocking retry | `@RetryableTopic` (intermediate retry topics) | No built-in equivalent |
+| DLQ support | `DeadLetterPublishingRecoverer` (automatic) | Manual producer send in catch block |
 | Idempotent producer | `enable.idempotence=true` in properties | `EnableIdempotence = true` in `ProducerConfig` |
 | Async model | `CompletableFuture` + `.whenComplete()` | `Task<DeliveryResult>` + `async/await` |
 
@@ -159,4 +239,8 @@ Spring Kafka's `DefaultErrorHandler` + `DeadLetterPublishingRecoverer` provides 
 
 ## Conclusion
 
-Both stacks implement the same event-driven patterns, but at different levels of abstraction. Spring Kafka's opinionated auto-configuration and built-in error handling reduce boilerplate significantly, making it faster to get a production-ready consumer running. The Confluent .NET client is lower-level and more explicit — it requires more code for the same resilience guarantees, but in return gives developers full visibility and control over every step of the consume-process-commit lifecycle. For teams already invested in the Spring ecosystem, the Java approach is more productive; for .NET teams preferring explicit control, the Confluent client is idiomatic and well-suited to `async/await`-heavy microservices.
+Both stacks implement the same event-driven patterns, but at different levels of abstraction. Spring Kafka's opinionated auto-configuration, built-in retry mechanisms (`DefaultErrorHandler`, `@RetryableTopic`), and automatic consumer group management reduce boilerplate significantly and make production-grade consumers faster to build and safer by default.
+
+The Confluent .NET client is lower-level and more explicit — it requires more code for the same resilience guarantees, but in return gives developers full visibility and control over every step of the consume-process-commit lifecycle. The `@RetryableTopic` pattern in particular has no direct .NET equivalent and represents a meaningful ergonomic advantage for Java teams dealing with high-throughput, fault-tolerant consumers.
+
+For teams already invested in the Spring ecosystem, the Java approach is more productive. For .NET teams, the explicit control is idiomatic and well-suited to `async/await`-heavy microservices, provided the team is prepared to build retry and DLQ infrastructure from scratch.

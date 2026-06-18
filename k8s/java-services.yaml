@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
         - name: java-order-producer
-          image: replace-with-your-java-order-producer-image
+          image: danie-carbondatasolutions/order-producer-service:latest
           env:
             - name: KAFKA_BOOTSTRAP_SERVERS
               value: "kafka-service:9092"
@@ -23,17 +23,17 @@ spec:
           resources:
             requests:
               cpu: "100m"
-              memory: "128Mi"
-            limits:
-              cpu: "250m"
               memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: java-payment-service
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: java-payment-service
@@ -44,7 +44,7 @@ spec:
     spec:
       containers:
         - name: java-payment-service
-          image: replace-with-your-java-payment-service-image
+          image: danie-carbondatasolutions/payment-service:latest
           env:
             - name: KAFKA_BOOTSTRAP_SERVERS
               value: "kafka-service:9092"
@@ -54,20 +54,22 @@ spec:
               value: "payment.succeeded"
             - name: PAYMENT_FAILED_TOPIC
               value: "payment.failed"
+            - name: PAYMENT_DLQ_TOPIC
+              value: "payment.dlq"
           resources:
             requests:
               cpu: "100m"
-              memory: "128Mi"
-            limits:
-              cpu: "250m"
               memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: java-inventory-service
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: java-inventory-service
@@ -78,16 +80,18 @@ spec:
     spec:
       containers:
         - name: java-inventory-service
-          image: replace-with-your-java-inventory-service-image
+          image: danie-carbondatasolutions/inventory-service:latest
           env:
             - name: KAFKA_BOOTSTRAP_SERVERS
               value: "kafka-service:9092"
             - name: PAYMENT_SUCCESS_TOPIC
               value: "payment.succeeded"
+            - name: INVENTORY_DLQ_TOPIC
+              value: "inventory.dlq"
           resources:
             requests:
               cpu: "100m"
-              memory: "128Mi"
-            limits:
-              cpu: "250m"
               memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
